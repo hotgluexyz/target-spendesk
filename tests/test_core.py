@@ -579,3 +579,55 @@ def test_account_natural_key_conflict_does_not_block_a_different_purpose(run, re
     )
     assert "natural key already exists" in bookmark(state, "Accounts", "conflict")["error"]
     assert bookmark(state, "Accounts", "different-purpose")["id"] == "new-account"
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_account_code_reuses_unlinked_account_without_manual_mapping(run, requests_mock, duplicate):
+    account = {
+        "id": "existing",
+        "companyId": "company-one",
+        "type": "expense",
+        "code": "00625",
+        "name": "Existing travel",
+        "description": "Preserve this",
+    }
+    requests_mock.get(
+        BASE + "/v1/experimental/accounts",
+        json={
+            "data": [account, {**account, "id": "duplicate"}] if duplicate else [account],
+            "totalResults": 2 if duplicate else 1,
+        },
+    )
+    requests_mock.get(BASE + "/v1/experimental/accounts/existing", json=account)
+
+    def put(request, context):
+        body = request.json()["accounts"][0]
+        assert body["id"] == "existing"
+        assert body["code"] == "00625"
+        assert body["description"] == "Preserve this"
+        return {"items": [{**body, "id": "existing"}]}
+
+    writes = requests_mock.put(BASE + "/v1/experimental/accounts", json=put)
+    requests_mock.post(REFS, json=reference_response)
+    state = run(
+        [
+            (
+                "Accounts",
+                {
+                    "externalId": "rillet-account",
+                    "type": "expense",
+                    "code": "00625",
+                    "name": "Travel",
+                },
+            )
+        ]
+    )
+    result = bookmark(state, "Accounts", "rillet-account")
+    if duplicate:
+        assert result["success"] is False
+        assert "Ambiguous" in result["error"]
+        assert writes.call_count == 0
+    else:
+        assert result["success"] is True
+        assert result["id"] == "existing"
+        assert state["summary"]["Accounts"]["updated"] == 1

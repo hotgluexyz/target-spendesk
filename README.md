@@ -88,7 +88,9 @@ Example RECORD bodies (send the corresponding SCHEMA message before each stream)
   then register the mapping after an acknowledged write. Explicit Spendesk IDs that
   conflict with an existing mapping are rejected, not silently reassigned.
 - Accounts search **all pages**, including archived rows, by type and ERP external ID.
-  A colliding account code requires explicit reconciliation; it is not a name match.
+  A unique, unlinked account matching the exact code, purpose, auxiliary code and
+  tax rate is adopted automatically. Ambiguous matches and accounts owned by another
+  ERP identity require reconciliation; names alone never establish identity.
   Updates read and merge existing writable fields because PUT clears omitted values.
   A null purpose returned by GET is omitted from that merge: the demo write validator
   rejects null purpose despite the OpenAPI nullable annotation. Availability is read-only.

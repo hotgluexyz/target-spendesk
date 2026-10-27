@@ -57,17 +57,25 @@ class AccountsSink(SpendeskRecordSink):
             if account_type == "reverseCharge"
             else ("code", "purpose", "auxiliaryCode", "taxRate")
         )
-        for account in accounts:
-            if (
-                record.get("code")
-                and not record.get("isArchived")
-                and not account.get("isArchived")
-                and all(account.get(k) == record.get(k) for k in natural_key)
-            ):
-                if account["id"] != remote_id:
-                    raise ValueError(
-                        "Account natural key already exists; explicitly reconcile its id first"
-                    )
+        candidates = [
+            account
+            for account in accounts
+            if record.get("code")
+            and not record.get("isArchived")
+            and not account.get("isArchived")
+            and all(account.get(k) == record.get(k) for k in natural_key)
+        ]
+        if not remote_id and len(candidates) == 1:
+            candidate = candidates[0]
+            if candidate.get("externalId") in (None, "", record["externalId"]):
+                remote_id = candidate["id"]
+        if len(candidates) > 1:
+            raise ValueError("Ambiguous account natural key")
+        for account in candidates:
+            if account["id"] != remote_id:
+                raise ValueError(
+                    "Account natural key already exists; explicitly reconcile its id first"
+                )
         existing = {}
         if remote_id:
             existing = self.api.request("GET", self.endpoint + "/" + segment(remote_id))
