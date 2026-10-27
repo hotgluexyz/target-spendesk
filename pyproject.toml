@@ -1,0 +1,36 @@
+[project]
+name = "target-spendesk"
+version = "0.1.0"
+description = "Spendesk reference-data and export write-back target built with the Hotglue Singer SDK."
+authors = [{ name = "Hotglue", email = "hello@hotglue.com" }]
+keywords = [
+    "ELT",
+    "spendesk",
+]
+license = "MIT"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "requests>=2.25.1",
+    "hotglue-singer-sdk==1.0.51",
+]
+
+[project.scripts]
+target-spendesk = 'target_spendesk.target:TargetSpendesk.cli'
+
+[dependency-groups]
+dev = [
+    "pytest>=7",
+    "requests-mock>=1.12",
+    "ruff>=0.15",
+]
+
+[tool.ruff]
+line-length = 100
+required-version = ">=0.15"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[build-system]
+requires = ["poetry-core>=2"]
+build-backend = "poetry.core.masonry.api"

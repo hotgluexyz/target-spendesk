@@ -1,0 +1,7 @@
+{
+  "api_url": "https://public-api.demo.spendesk.com",
+  "company_id": "YOUR_SPENDESK_COMPANY_ID",
+  "client_id": "YOUR_CLIENT_ID",
+  "client_secret": "YOUR_CLIENT_SECRET",
+  "provider": "rillet"
+}
