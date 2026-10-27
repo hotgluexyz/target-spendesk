@@ -39,11 +39,6 @@ class TargetSpendesk(TargetHotglue):
             "client_secret", th.StringType, required=True, description="Sensitive credential"
         ),
         th.Property("provider", th.StringType, default="rillet"),
-        th.Property(
-            "create_journal_path",
-            th.StringType,
-            description="Durable create-intent journal; default SNAPSHOT_DIR/spendesk-creates.json",
-        ),
     ).to_dict()
 
     @cached_property

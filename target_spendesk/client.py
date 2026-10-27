@@ -2,12 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 import random
 import time
-from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import requests
@@ -28,12 +24,6 @@ class SpendeskClient:
         self.session = requests.Session()
         self.token = None
         self.expires_at = 0
-        self.journal_path = Path(
-            config.get(
-                "create_journal_path",
-                str(Path(os.environ.get("SNAPSHOT_DIR", "snapshots")) / "spendesk-creates.json"),
-            )
-        )
 
     def request(self, method, path, **kwargs):
         for attempt in range(5):
@@ -101,30 +91,6 @@ class SpendeskClient:
             raise ValueError(f"Spendesk reference failed: {rows[0].get('reason', 'unknown')}")
         return payload["entityId"]
 
-    def journal(self, key, value=None):
-        """Persist create intent before POST; unknown outcomes require reconciliation."""
-        records = json.loads(self.journal_path.read_text()) if self.journal_path.exists() else {}
-        scoped_key = hashlib.sha256(
-            json.dumps(
-                [
-                    self.base_url,
-                    self.config["company_id"],
-                    self.config.get("provider", "rillet"),
-                    key,
-                ]
-            ).encode()
-        ).hexdigest()
-        if value is None:
-            return records.get(scoped_key)
-        records[scoped_key] = value
-        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.journal_path.with_suffix(".tmp")
-        with temporary.open("w") as handle:
-            json.dump(records, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(self.journal_path)
-
 
 class SpendeskRecordSink(HotglueSink):
     """Native reference-data upserts; source IDs stay in SDK state, not API bodies."""
@@ -166,20 +132,13 @@ class SpendeskRecordSink(HotglueSink):
 
     def prepare_reference(self, record, context, entity_type=None):
         entity_type = entity_type or self.entity_type
-        key = [entity_type, record["externalId"]]
         remote_id = self.api.reference(entity_type, record["externalId"])
-        intent = self.api.journal(key)
         explicit_id = record.get("id")
         if remote_id and explicit_id and remote_id != explicit_id:
             raise ValueError("Explicit id conflicts with Spendesk external reference")
-        if intent and intent.get("id") and explicit_id and intent["id"] != explicit_id:
-            raise ValueError("Explicit id conflicts with the previously created Spendesk record")
-        remote_id = remote_id or explicit_id or (intent or {}).get("id")
-        if intent and not remote_id:
-            raise ValueError("Previous create outcome unknown; reconcile in Spendesk and supply id")
+        remote_id = remote_id or explicit_id
         context.update(
             remote_id=remote_id,
-            journal_key=key,
             reference={
                 "entityType": entity_type,
                 "externalId": record["externalId"],
@@ -189,20 +148,12 @@ class SpendeskRecordSink(HotglueSink):
 
     def upsert_record(self, record, context):
         remote_id = context["remote_id"]
-        if not remote_id:
-            self.api.journal(context["journal_key"], {"pending": True})
-        try:
-            result = self.api.request(
-                context.get("method", self.update_method if remote_id else "POST"),
-                context["path"],
-                json=context["body"],
-                params=context["params"],
-            )
-        except requests.HTTPError as error:
-            if not remote_id and error.response.status_code in (400, 401, 403, 404, 409, 422, 429):
-                # Explicit rejection is not an ambiguous create; corrected input can retry.
-                self.api.journal(context["journal_key"], {})
-            raise
+        result = self.api.request(
+            context.get("method", self.update_method if remote_id else "POST"),
+            context["path"],
+            json=context["body"],
+            params=context["params"],
+        )
         item = result.get(self.response_key, {}) if self.response_key else result
         if isinstance(item, list):
             if len(item) != 1:
@@ -211,6 +162,16 @@ class SpendeskRecordSink(HotglueSink):
         returned_id = item.get("id") if self.response_key else item.get("id") or remote_id
         if not returned_id or (remote_id and returned_id != remote_id):
             raise ValueError("Missing or conflicting Spendesk response id")
-        self.api.journal(context["journal_key"], {"id": returned_id})
-        self.api.map_reference({**context["reference"], "entityId": returned_id})
-        return returned_id, True, {"is_updated": bool(remote_id)}
+        metadata = {"is_updated": bool(remote_id)}
+        try:
+            self.api.map_reference({**context["reference"], "entityId": returned_id})
+        except Exception as error:
+            # The native write is confirmed. Preserve its ID for SDK snapshots even
+            # when the separate reference registration needs operator attention.
+            metadata["reference_registration_error"] = str(error)
+            self.logger.warning(
+                "Spendesk record %s saved, but external-reference registration failed: %s",
+                returned_id,
+                error,
+            )
+        return returned_id, True, metadata

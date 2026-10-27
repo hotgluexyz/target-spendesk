@@ -1,10 +1,10 @@
 """Exercise the Singer interface and its observable destination/state contract."""
 
 import copy
+import csv
 import io
 import json
 import re
-from pathlib import Path
 
 import pytest
 import requests
@@ -33,6 +33,7 @@ def run(tmp_path, monkeypatch, requests_mock):
     monkeypatch.setattr(
         "hotglue_singer_sdk.target_sdk.target.SNAPSHOT_DIR", str(tmp_path / "snapshots")
     )
+    monkeypatch.setattr("hotglue_singer_sdk.target_sdk.target.flow_id", "test-flow")
     requests_mock.post(BASE + "/v1/auth/token", json={"access_token": "token", "expires_in": 3600})
     requests_mock.get(REFS, json={"data": []})
     versions = {}
@@ -48,7 +49,14 @@ def run(tmp_path, monkeypatch, requests_mock):
     requests_mock.get(re.compile(BASE + r"/v1/payables/[^/?]+$"), json=payable_detail)
     requests_mock.get(BASE + "/v1/settlements", json=settlement_detail)
 
-    def execute(records, state=None):
+    def execute(records, state=None, snapshots=None):
+        for stream, rows in (snapshots or {}).items():
+            directory = tmp_path / "snapshots"
+            directory.mkdir(exist_ok=True)
+            with (directory / f"{stream}_test-flow.snapshot.csv").open("w") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["InputId", "RemoteId"])
+                writer.writeheader()
+                writer.writerows(rows)
         versions.update(
             {
                 r["id"]: r["version"]
@@ -139,20 +147,39 @@ def test_supplier_create_repeat_without_local_state_and_update(run, requests_moc
     first = run([("Suppliers", record)])
     assert bookmark(first, "Suppliers", "erp-vendor-7")["id"] == "supplier-1"
     assert first["summary"]["Suppliers"]["success"] == 1
-    Path("../snapshots/spendesk-creates.json").unlink()
     second = run([("Suppliers", {**record, "name": "Changed"})])
     assert bookmark(second, "Suppliers", "erp-vendor-7")["success"] is True
     assert suppliers == {
         "supplier-1": {"name": "Changed", "supplierDetails": {"legalName": "Legal Ltd"}}
     }
-    # Reusing successful state must also retain the original source/destination mapping.
-    repeated = run([("Suppliers", {**record, "name": "Changed"})], state=second)
+    # With native mappings unavailable, ordinary Hotglue snapshots restore the ID.
+    requests_mock.get(REFS, json={"data": []})
+    repeated = run(
+        [("Suppliers", {**record, "name": "Snapshot update"})],
+        snapshots={"Suppliers": [{"InputId": "erp-vendor-7", "RemoteId": "supplier-1"}]},
+    )
     assert bookmark(repeated, "Suppliers", "erp-vendor-7")["id"] == "supplier-1"
+    assert repeated["summary"]["Suppliers"]["updated"] == 1
+    assert suppliers["supplier-1"]["name"] == "Snapshot update"
     assert len(suppliers) == 1
+    assert (
+        sum(
+            r.method == "POST" and r.url == BASE + "/v1/suppliers"
+            for r in requests_mock.request_history
+        )
+        == 1
+    )
 
 
-def test_ambiguous_create_is_not_replayed_and_explicit_id_recovers(run, requests_mock):
-    requests_mock.post(BASE + "/v1/suppliers", exc=requests.ReadTimeout)
+@pytest.mark.parametrize("failure", ["timeout", "server-error", "rejected", "missing-id"])
+def test_failed_create_is_not_auto_retried_and_explicit_id_recovers(run, requests_mock, failure):
+    responses = {
+        "timeout": {"exc": requests.ReadTimeout},
+        "server-error": {"status_code": 503},
+        "rejected": {"status_code": 400},
+        "missing-id": {"json": {"item": {}}},
+    }
+    create = requests_mock.post(BASE + "/v1/suppliers", **responses[failure])
     record = {
         "externalId": "ambiguous",
         "name": "Unknown",
@@ -160,8 +187,8 @@ def test_ambiguous_create_is_not_replayed_and_explicit_id_recovers(run, requests
     }
     first = run([("Suppliers", record)])
     assert bookmark(first, "Suppliers", "ambiguous")["success"] is False
-    second = run([("Suppliers", record)])
-    assert "outcome unknown" in bookmark(second, "Suppliers", "ambiguous")["error"]
+    assert not bookmark(first, "Suppliers", "ambiguous").get("id")
+    assert create.call_count == 1
     requests_mock.patch(BASE + "/v1/suppliers/recovered", json={"item": {"id": "recovered"}})
     requests_mock.post(REFS, json=reference_response)
     recovered = run([("Suppliers", {**record, "id": "recovered"})])
@@ -169,8 +196,9 @@ def test_ambiguous_create_is_not_replayed_and_explicit_id_recovers(run, requests
     assert bookmark(recovered, "Suppliers", "ambiguous")["success"] is True
 
 
-def test_create_survives_failed_reference_registration(run, requests_mock):
-    requests_mock.post(BASE + "/v1/suppliers", json={"item": {"id": "created"}})
+@pytest.mark.parametrize("failure", ["outcome", "timeout"])
+def test_create_survives_failed_reference_registration(run, requests_mock, caplog, failure):
+    create = requests_mock.post(BASE + "/v1/suppliers", json={"item": {"id": "created"}})
     requests_mock.post(
         REFS,
         json={
@@ -185,18 +213,29 @@ def test_create_survives_failed_reference_registration(run, requests_mock):
             ]
         },
     )
+    if failure == "timeout":
+        requests_mock.post(REFS, exc=requests.ReadTimeout("registration timed out"))
     record = {
         "externalId": "recovery",
         "name": "Vendor",
         "supplierDetails": {"legalName": "Vendor Ltd"},
     }
     first = run([("Suppliers", record)])
-    assert bookmark(first, "Suppliers", "recovery")["success"] is False
+    saved = bookmark(first, "Suppliers", "recovery")
+    assert saved["success"] is True
+    assert saved["id"] == "created"
+    assert saved["reference_registration_error"]
+    assert "external-reference registration failed" in caplog.text
     requests_mock.patch(BASE + "/v1/suppliers/created", json={"item": {"id": "created"}})
     requests_mock.post(REFS, json=reference_response)
-    second = run([("Suppliers", record)])
+    second = run(
+        [("Suppliers", record)],
+        snapshots={"Suppliers": [{"InputId": saved["externalId"], "RemoteId": saved["id"]}]},
+    )
     assert bookmark(second, "Suppliers", "recovery")["id"] == "created"
     assert bookmark(second, "Suppliers", "recovery")["success"] is True
+    assert "reference_registration_error" not in bookmark(second, "Suppliers", "recovery")
+    assert create.call_count == 1
 
 
 @pytest.mark.parametrize("purpose", [None, "company"])
@@ -359,15 +398,42 @@ def test_cost_center_empty_update_response_and_external_reference_conflict(run, 
         REFS,
         json={"data": [{"entityType": "supplier", "entityId": "other", "externalId": "vendor-1"}]},
     )
+    requests_mock.post(
+        REFS,
+        status_code=207,
+        json={
+            "data": [
+                {
+                    "entityType": "supplier",
+                    "entityId": "supplier-2",
+                    "externalId": "vendor-2",
+                    "outcome": "failed",
+                    "reason": "registration rejected",
+                }
+            ]
+        },
+    )
     state = run(
         [
             (
                 "ExternalReferences",
                 {"externalId": "vendor-1", "entityType": "supplier", "entityId": "wrong"},
-            )
-        ]
+            ),
+            (
+                "ExternalReferences",
+                {"externalId": "vendor-2", "entityType": "supplier", "entityId": "supplier-2"},
+            ),
+            ("Suppliers", {"externalId": "vendor-1", "name": "Conflict"}),
+        ],
+        snapshots={"Suppliers": [{"InputId": "vendor-1", "RemoteId": "wrong"}]},
     )
     assert bookmark(state, "ExternalReferences", "vendor-1")["success"] is False
+    assert "registration rejected" in bookmark(state, "ExternalReferences", "vendor-2")["error"]
+    assert "conflicts" in bookmark(state, "Suppliers", "vendor-1")["error"]
+    assert not any(
+        r.method in ("POST", "PATCH") and "/suppliers" in r.url
+        for r in requests_mock.request_history
+    )
 
 
 def test_429_retry_and_export_confirmation_company_guards(run, requests_mock, monkeypatch):
@@ -409,6 +475,23 @@ def test_429_retry_and_export_confirmation_company_guards(run, requests_mock, mo
     assert bookmark(state, "SettlementStatus", "unsafe")["success"] is False
     assert bookmark(state, "ExternalReferences", "unsafe-ref")["success"] is False
     assert bookmark(state, "Suppliers", "wrong-company")["success"] is False
+    rate_limited = requests_mock.put(BASE + "/v1/settlements/state", status_code=429)
+    exhausted = run(
+        [
+            (
+                "SettlementStatus",
+                {
+                    "externalId": "exhausted",
+                    "id": "s3",
+                    "version": 1,
+                    "state": "exported",
+                    "exportConfirmed": True,
+                },
+            )
+        ]
+    )
+    assert rate_limited.call_count == 5
+    assert bookmark(exhausted, "SettlementStatus", "exhausted")["success"] is False
 
 
 def test_writeback_preflight_rejects_stale_and_invalid_versions(run, requests_mock):

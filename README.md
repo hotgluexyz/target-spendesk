@@ -29,7 +29,6 @@ the partner PKCE authorization flow. Every API request includes `X-Company-Id`.
 | `company_id` | Yes | Destination Spendesk company |
 | `api_url` | No | `https://public-api.spendesk.com`; use `https://public-api.demo.spendesk.com` for sandbox; no `/v1` suffix |
 | `provider` | No | `rillet`; external-reference namespace |
-| `create_journal_path` | No | `$SNAPSHOT_DIR/spendesk-creates.json`, or `snapshots/spendesk-creates.json` locally |
 
 Required API scopes: chart-of-accounts read/write, supplier read/write, cost-center
 read/write, analytical-field read/write, external-reference read/write, payable and
@@ -93,16 +92,21 @@ Example RECORD bodies (send the corresponding SCHEMA message before each stream)
   Updates read and merge existing writable fields because PUT clears omitted values.
   A null purpose returned by GET is omitted from that merge: the demo write validator
   rejects null purpose despite the OpenAPI nullable annotation. Availability is read-only.
-- Creates are journaled before sending. The returned ID is persisted before registering
-  its external reference, so registration failures can recover without another create.
-  If a create times out without an ID, the next run **fails closed** until an operator
-  reconciles Spendesk and supplies the actual `id`. Known 4xx rejections allow corrected
-  input to retry. There are no automatic retries of ambiguous writes.
-- **Persist the create journal across jobs and serialize writers per company/provider.**
-  Successful external mappings recover after local state loss; an unacknowledged create
-  without a remote mapping still needs its durable journal. If both journal and mapping
-  are lost, manually reconcile before rerunning; the API has no documented create
-  idempotency key. A job-local ephemeral journal is not sufficient for that case.
+- Identity uses standard SDK/Hotglue mappings: successful bookmarks retain `externalId`
+  and Spendesk `id`; ordinary `InputId`/`RemoteId` snapshots restore `id` before loading.
+  The SDK reads `<Stream>_<FLOW>.snapshot.csv` (or `.parquet`) from `SNAPSHOT_DIR`.
+  A restored ID selects update, even when no native external reference exists yet.
+- A confirmed native write remains successful with its returned ID if subsequent
+  external-reference registration fails. Its bookmark includes
+  `reference_registration_error`, and a warning is logged. Inspect these separately
+  from native-write failures; repair via `ExternalReferences` or replay with the known
+  ID/snapshot. The explicit `ExternalReferences` stream still fails on rejected rows.
+- There is no custom recovery file. Successful native external mappings can reconcile
+  without local snapshots. If a create has an ambiguous response and no known ID or
+  native mapping, reconcile Spendesk and supply its actual `id` **before rerunning**;
+  the API has no documented create idempotency key. The target does not automatically
+  retry ambiguous writes, but cannot prevent a new job from creating a duplicate when
+  neither SDK identity nor a native mapping is available.
 - Accounts, cost centers, analytical fields/values and suppliers are processed individually,
   not buffered, so mapped parents are available to subsequent child records.
 

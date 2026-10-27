@@ -92,16 +92,12 @@ class AccountsSink(SpendeskRecordSink):
             method="PUT",
             params={"type": account_type},
             remote_id=remote_id,
-            journal_key=[account_type + "Account", record["externalId"]],
             reference={
                 "entityType": account_type + "Account",
                 "provider": self.config.get("provider", "rillet"),
                 "externalId": record["externalId"],
             },
         )
-        intent = self.api.journal(context["journal_key"])
-        if intent and not remote_id:
-            raise ValueError("Previous account create unresolved; reconcile its id first")
         return record
 
 
